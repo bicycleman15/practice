@@ -44,6 +44,9 @@ def main():
 
     bar = tqdm(train_iterator, total=train_config.steps, desc="Training")
     for i, (x, y) in enumerate(bar):
+        if i >= train_config.steps:
+            break
+
         optimizer.zero_grad()
 
         x, y = x.to(device), y.to(device)
@@ -65,7 +68,8 @@ def main():
             # let's generate some new tokens
             prompt = x[:1, :10] # [1, 10]
 
-            decoded_tokens = generate(model, prompt, 30) # generate 30 new tokens; [1, 30]
+            # generate 30 new tokens; [1, 30]
+            decoded_tokens = generate(model, prompt, max_new_tokens=30, temperature=0.8, top_k=50, top_p=0.95)
 
             print("Input:", tokenizer.decode(prompt[0]))
             print("Output:", tokenizer.decode(decoded_tokens[0]))

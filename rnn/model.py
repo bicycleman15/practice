@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 from tqdm import tqdm
 
+from rnn.utils import sample
+
 @dataclass
 class RNNConfig:
 
@@ -87,12 +89,13 @@ class RNN(nn.Module):
 
 
 @torch.inference_mode()
-def generate(model: RNN, input_ids: torch.Tensor, max_new_tokens: int):
+def generate(model: RNN, input_ids: torch.Tensor, max_new_tokens: int, temperature: float = 0.8, top_k: int = 50, top_p: float = 0.95):
 
     logits, s_list = model(input_ids, return_state_list=True)
 
     # decode this token
-    next_token = logits[:, -1, :].argmax(dim=-1) # [B]
+    # next_token = logits[:, -1, :].argmax(dim=-1) # [B]
+    next_token = sample(logits[:, -1, :], temperature, top_k, top_p)
 
     # add this to list
     decoded_tokens = list()
@@ -106,7 +109,7 @@ def generate(model: RNN, input_ids: torch.Tensor, max_new_tokens: int):
 
         logits = model.output(y) # [B, V]
 
-        next_token = logits.argmax(dim=-1) # [B]
+        next_token = sample(logits, temperature, top_k, top_p)
         decoded_tokens.append(next_token.clone())
 
     decoded_tokens = torch.cat([t.unsqueeze(1) for t in decoded_tokens], dim=1)
