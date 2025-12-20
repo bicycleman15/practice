@@ -17,6 +17,8 @@ class TrainConfig:
 
     steps = 1000
 
+    grad_accum = 1
+
     eval_after = 50
 
     tokenizer_name = "meta-llama/Llama-2-7b-hf"
@@ -43,11 +45,13 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
     bar = tqdm(train_iterator, total=train_config.steps, desc="Training")
+
+    # just making sure we don't have any gradients apriori
+    optimizer.zero_grad()
+
     for i, (x, y) in enumerate(bar):
         if i >= train_config.steps:
             break
-
-        optimizer.zero_grad()
 
         x, y = x.to(device), y.to(device)
 
@@ -59,9 +63,12 @@ def main():
         )
 
         loss.backward()
-        optimizer.step()
 
-        bar.set_postfix_str(f"loss: {loss.item():02f}")
+        if (i + 1) % train_config.grad_accum == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+            bar.set_postfix_str(f"loss: {loss.item():02f}")
 
         if (i > 0) and (i % train_config.eval_after == 0):
 
