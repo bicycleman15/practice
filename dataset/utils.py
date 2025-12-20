@@ -24,7 +24,7 @@ class tiny_stories_dataset(IterableDataset):
 
         # permute sequences
         # fix seed of randperm to some constant
-        g = torch.Generator().manual_seed(43)
+        g = torch.Generator().manual_seed(42)
         perm = torch.randperm(self.tokens.shape[0], generator=g)
         self.tokens = self.tokens[perm, :]
         self.tokens = self.tokens.reshape(-1)

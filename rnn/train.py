@@ -1,9 +1,13 @@
+# Run using: 
+# python -m rnn.train
+
 import torch
 from dataclasses import dataclass
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 from dataset.utils import tiny_stories_dataset
-from rnn.model import RNNConfig, RNN
+from rnn.model import RNNConfig, RNN, generate
 
 @dataclass
 class TrainConfig:
@@ -12,6 +16,10 @@ class TrainConfig:
     block_size = 128
 
     steps = 1000
+
+    eval_after = 50
+
+    tokenizer_name = "meta-llama/Llama-2-7b-hf"
 
 def main():
 
@@ -30,6 +38,7 @@ def main():
         train_config.batch_size,
     )
     train_iterator = iter(dataset)
+    tokenizer = AutoTokenizer.from_pretrained(train_config.tokenizer_name)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
@@ -50,6 +59,18 @@ def main():
         optimizer.step()
 
         bar.set_postfix_str(f"loss: {loss.item():02f}")
+
+        if (i > 0) and (i % train_config.eval_after == 0):
+
+            # let's generate some new tokens
+            prompt = x[:1, :10] # [1, 10]
+
+            decoded_tokens = generate(model, prompt, 30) # generate 30 new tokens; [1, 30]
+
+            print("Input:", tokenizer.decode(prompt[0]))
+            print("Output:", tokenizer.decode(decoded_tokens[0]))
+            print()
+
 
 if __name__ == "__main__":
     main()

@@ -49,7 +49,7 @@ class RNN(nn.Module):
         self.starter = nn.Embedding(self.config.layers, self.config.dim)
 
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, return_state_list=False):
 
         B, L = input_ids.shape
         
@@ -70,6 +70,9 @@ class RNN(nn.Module):
         ys = torch.cat(ys, dim=1)
         logits = self.output(ys)
 
+        if return_state_list:
+            return logits, s_list
+
         return logits
 
 
@@ -81,6 +84,33 @@ class RNN(nn.Module):
             new_s_list.append(s)
 
         return x, new_s_list
+
+
+@torch.inference_mode()
+def generate(model: RNN, input_ids: torch.Tensor, max_new_tokens: int):
+
+    logits, s_list = model(input_ids, return_state_list=True)
+
+    # decode this token
+    next_token = logits[:, -1, :].argmax(dim=-1) # [B]
+
+    # add this to list
+    decoded_tokens = list()
+    decoded_tokens.append(next_token.clone())
+
+    for _ in tqdm(range(max_new_tokens - 1)):
+        
+        x = model.embed(next_token) # [B, D]
+        
+        y, s_list = model.update(x, s_list)
+
+        logits = model.output(y) # [B, V]
+
+        next_token = logits.argmax(dim=-1) # [B]
+        decoded_tokens.append(next_token.clone())
+
+    decoded_tokens = torch.cat([t.unsqueeze(1) for t in decoded_tokens], dim=1)
+    return decoded_tokens
 
 
 if __name__ == "__main__":
@@ -103,7 +133,7 @@ if __name__ == "__main__":
     print(logits.shape)
 
     # calc loss
-    bar = tqdm(range(1000))
+    bar = tqdm(range(2))
     for _ in bar:
         optimizer.zero_grad()
 
@@ -114,3 +144,6 @@ if __name__ == "__main__":
         loss.backward()
         optimizer.step()
         bar.set_postfix_str(f"loss={loss.item():02f}")
+
+    decoded_tokens = generate(model, input_ids[:, :10], 12)
+    print(decoded_tokens.shape)
