@@ -14,14 +14,14 @@ class RNNConfig:
     dim = 64
     layers = 4
 
-    vocab_size = 1024
+    vocab_size = 32000
 
 
 class RNNBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.update_network = nn.Linear(2 * config.dim, 2 * config.dim)
+        self.update_network = nn.Linear(2 * config.dim, 2 * config.dim, bias=False)
 
     def forward(self, x, s):
         xs = torch.cat([x, s], dim=1) # [B, 2D]
@@ -44,7 +44,7 @@ class RNN(nn.Module):
             RNNBlock(self.config) for _ in range(self.config.layers)
         )
 
-        self.output = nn.Linear(self.config.dim, self.config.vocab_size)
+        self.output = nn.Linear(self.config.dim, self.config.vocab_size, bias=False)
 
         self.starter = nn.Embedding(self.config.layers, self.config.dim)
 
