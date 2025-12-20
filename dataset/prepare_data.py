@@ -7,6 +7,7 @@ import datasets
 from transformers import AutoTokenizer
 
 BUFFER_SIZE = 10_000_000
+TOKENIZER_NAME = "meta-llama/Llama-2-7b-hf"
 
 _tokenizer = None
 
@@ -16,7 +17,7 @@ def tokenize(x: dict):
     global _tokenizer
     if _tokenizer is None:
         # load the tokenizer for this process
-        _tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        _tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     input_ids = _tokenizer.encode(text, add_special_tokens=False)
 
     # also attach EOS
