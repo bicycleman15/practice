@@ -49,23 +49,31 @@ def main():
     # just making sure we don't have any gradients apriori
     optimizer.zero_grad()
 
+    # amp stuff
+    grad_scaler = torch.amp.GradScaler()
+
     for i, (x, y) in enumerate(bar):
         if i >= train_config.steps:
             break
 
         x, y = x.to(device), y.to(device)
 
-        logits = model(x)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits = model(x)
 
-        loss = torch.nn.functional.cross_entropy(
-            logits.view(-1, logits.shape[-1]),
-            y.view(-1)
-        )
+            loss = torch.nn.functional.cross_entropy(
+                logits.view(-1, logits.shape[-1]),
+                y.view(-1)
+            )
 
-        loss.backward()
+        # loss.backward()
+        grad_scaler.scale(loss).backward()
 
         if (i + 1) % train_config.grad_accum == 0:
-            optimizer.step()
+            # optimizer.step()
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+
             optimizer.zero_grad()
 
             bar.set_postfix_str(f"loss: {loss.item():02f}")
