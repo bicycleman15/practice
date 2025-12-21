@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 
 from dataset.utils import tiny_stories_dataset
 from rnn.model import RNNConfig, RNN, generate
+from rnn.lstm import LSTMConfig, LSTM, generate as generate_lstm
 
 @dataclass
 class TrainConfig:
@@ -23,14 +24,23 @@ class TrainConfig:
 
     tokenizer_name = "meta-llama/Llama-2-7b-hf"
 
+    model_type = "rnn"  # "rnn" or "lstm"
+
 def main():
 
     device = "mps"
 
     train_config = TrainConfig()
     
-    config = RNNConfig()
-    model = RNN(config)
+    if train_config.model_type == "lstm":
+        config = LSTMConfig()
+        model = LSTM(config)
+        gen_fn = generate_lstm
+    else:
+        config = RNNConfig()
+        model = RNN(config)
+        gen_fn = generate
+    
     model.to(device)
 
     print(model)
@@ -84,7 +94,7 @@ def main():
             prompt = x[:1, :10] # [1, 10]
 
             # generate 30 new tokens; [1, 30]
-            decoded_tokens = generate(model, prompt, max_new_tokens=30, temperature=0.8, top_k=50, top_p=0.95)
+            decoded_tokens = gen_fn(model, prompt, max_new_tokens=30, temperature=0.8, top_k=50, top_p=0.95)
 
             print("Input:", tokenizer.decode(prompt[0]))
             print("Output:", tokenizer.decode(decoded_tokens[0]))
