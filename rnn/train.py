@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 from dataset.utils import tiny_stories_dataset
 from rnn.model import RNNConfig, RNN, generate
 from rnn.lstm import LSTMConfig, LSTM, generate as generate_lstm
+from rnn.gru import GRUConfig, GRU, generate as generate_gru
 
 @dataclass
 class TrainConfig:
@@ -24,18 +25,24 @@ class TrainConfig:
 
     tokenizer_name = "meta-llama/Llama-2-7b-hf"
 
-    model_type = "rnn"  # "rnn" or "lstm"
+    model_type = "gru"  # "rnn", "lstm", or "gru"
 
 def main():
 
     device = "mps"
 
     train_config = TrainConfig()
+
+    print(train_config)
     
     if train_config.model_type == "lstm":
         config = LSTMConfig()
         model = LSTM(config)
         gen_fn = generate_lstm
+    elif train_config.model_type == "gru":
+        config = GRUConfig()
+        model = GRU(config)
+        gen_fn = generate_gru
     else:
         config = RNNConfig()
         model = RNN(config)
