@@ -10,24 +10,36 @@ def cross_entropy(logits, targets):
 
     logits = logits - max_logit # [N, C]
 
-    class_logits = logits[torch.arange(N), targets] # [N]
+    class_logits = logits[torch.arange(N, device=logits.device), targets] # [N]
 
     loss = -class_logits + torch.log(torch.sum(torch.exp(logits), dim=-1)) # [N]
 
     return loss.mean()
 
-if __name__ == "__main__":
+# let's do the chunking logic in cross entropy
+def cross_entropy_chunked(logits, targets, chunk_size=128):
+    # logits: [N, C]
+    # targets: [N]
 
-    N, C = 8, 128
+    N, C = logits.shape
 
-    logits = torch.randn((N, C))
-    targets = torch.randint(0, C, size=(N,))
+    max_logit = logits.max(dim=-1)[0].detach() # [N]
 
-    print(logits.shape)
-    print(targets.shape)
+    class_logits = logits[torch.arange(N, device=logits.device), targets] - max_logit # [N]
 
-    loss_ref = torch.nn.functional.cross_entropy(logits, targets)
-    print(loss_ref)
+    denominator = torch.zeros_like(class_logits)
 
-    loss = cross_entropy(logits, targets)
-    print(loss)
+    # now we need to calculate the denominator but in chunks
+    # so that we never init the [N, C] another tensor
+    # right now I am assuming I am chunking over classes
+    i = 0
+    while i < C:
+        # this doesn't save memory since we instatiate torch.exp()
+        # this takes up [N, chunk]
+        logit_chunk = logits[:, i : i + chunk_size] # [N, chunk]
+        denominator += torch.sum(torch.exp(logit_chunk - max_logit.unsqueeze(-1)), dim=1) # [N]
+        i += chunk_size
+
+    loss = -class_logits + torch.log(denominator) # [N]
+
+    return loss.mean()
