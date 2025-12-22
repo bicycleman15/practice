@@ -97,6 +97,8 @@ def generate(model: RNN, input_ids: torch.Tensor, max_new_tokens: int, temperatu
     # next_token = logits[:, -1, :].argmax(dim=-1) # [B]
     next_token = sample(logits[:, -1, :], temperature, top_k, top_p)
 
+    finished = torch.full((logits.shape[0]), False, dtype=torch.bool)
+
     # add this to list
     decoded_tokens = list()
     decoded_tokens.append(next_token.clone())
@@ -105,12 +107,31 @@ def generate(model: RNN, input_ids: torch.Tensor, max_new_tokens: int, temperatu
         
         x = model.embed(next_token) # [B, D]
         
-        y, s_list = model.update(x, s_list)
+        y, s_list_new = model.update(x, s_list)
 
         logits = model.output(y) # [B, V]
 
         next_token = sample(logits, temperature, top_k, top_p)
+
+        # just finished
+        just_finished = (next_token == 0) # 0 is EOS token id
+        finished = finished | just_finished
+
+        # change next token accordingly
+        # 
+        # EOS token feeded again might result in different next tokens
+        # for sequence alreay finished, so make sure they always stay EOS
+        next_token = torch.where(finished, 0, next_token)
+
+        # change states accordingly
+        alive = 1 - finished
+        for i in range(len(s_list)):
+            s_list[i] = alive * s_list_new[i] + (1 - alive) * s_list[i]
+
         decoded_tokens.append(next_token.clone())
+
+        if torch.all(finished):
+            break
 
     decoded_tokens = torch.cat([t.unsqueeze(1) for t in decoded_tokens], dim=1)
     return decoded_tokens
