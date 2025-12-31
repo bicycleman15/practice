@@ -52,7 +52,9 @@ def ex_gather_3d(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return y: (B, T) where y[b,t] = x[b,t, idx[b,t]]
     """
     # TODO: implement using torch.gather
-    raise NotImplementedError
+    idx = idx.unsqueeze(-1) # [B, 1]
+    y = torch.gather(x, dim=-1, index=idx).squeeze(-1)
+    return y
 
 
 def ex_gather_nll(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -62,7 +64,12 @@ def ex_gather_nll(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return nll: (B, T) where nll[b,t] = -log_softmax(logits)[b,t,targets[b,t]]
     """
     # TODO: implement with log_softmax + gather
-    raise NotImplementedError
+    
+    b = torch.logsumexp(logits, dim=-1) # [B, T]
+
+    selected_logs = ex_gather_3d(logits, targets) # [B, T]
+
+    return -selected_logs + b
 
 
 # ---- torch.scatter / scatter_add ----
@@ -72,7 +79,14 @@ def ex_scatter_onehot(idx: torch.Tensor, num_classes: int) -> torch.Tensor:
     return onehot: (B, num_classes)
     """
     # TODO: implement with scatter_
-    raise NotImplementedError
+    B = idx.shape[0]
+    C = num_classes
+    
+    one_hot = torch.zeros((B, C), device=idx.device) # [B, C]
+
+    one_hot.scatter_(dim=-1, index=idx.unsqueeze(-1), value=1)
+
+    return one_hot
 
 
 def ex_scatter_add_hist(idx: torch.Tensor, w: torch.Tensor, num_bins: int) -> torch.Tensor:
@@ -82,7 +96,13 @@ def ex_scatter_add_hist(idx: torch.Tensor, w: torch.Tensor, num_bins: int) -> to
     return hist: (num_bins,) where hist[i] = sum_{b: idx[b]=i} w[b]
     """
     # TODO: implement with scatter_add_ (or scatter_ with reduce add if you want)
-    raise NotImplementedError
+    B = idx.shape[0]
+    
+    hist = torch.zeros((num_bins,), dtype=w.dtype, device=w.device)
+
+    hist.scatter_add_(src=w, index=idx, dim=0)
+
+    return hist
 
 
 def ex_scatter_reverse_gather(idx: torch.Tensor, y: torch.Tensor, n: int) -> torch.Tensor:
@@ -93,7 +113,12 @@ def ex_scatter_reverse_gather(idx: torch.Tensor, y: torch.Tensor, n: int) -> tor
       If duplicates in idx, SUM the corresponding y into x_hat (so use scatter_add).
     """
     # TODO: implement with scatter_add_
-    raise NotImplementedError
+    B = idx.shape[0]
+    x_hat = torch.zeros((B, n), device=y.device, dtype=y.dtype)
+
+    x_hat.scatter_add_(dim=1, index=idx, src=y)
+
+    return x_hat
 
 
 def ex_scatter_bow(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
@@ -102,7 +127,14 @@ def ex_scatter_bow(tokens: torch.Tensor, vocab_size: int) -> torch.Tensor:
     return bow: (B, vocab_size) counts per vocab id (integer counts in float tensor OK)
     """
     # TODO: scatter_add counts
-    raise NotImplementedError
+
+    B = tokens.shape[0]
+    
+    bow = torch.zeros((B, vocab_size))
+    ones = torch.ones_like(tokens).to(bow.dtype)
+    bow.scatter_add_(src=ones, dim=1, index=tokens)
+
+    return bow
 
 
 # ---- torch.index_select ----
@@ -113,7 +145,7 @@ def ex_index_select_cols(x: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
     return y: (B, K) selecting columns
     """
     # TODO: implement with torch.index_select
-    raise NotImplementedError
+    return torch.index_select(x, index=cols, dim=1)
 
 
 def ex_index_select_timesteps(x: torch.Tensor, t_idx: torch.Tensor) -> torch.Tensor:
@@ -123,7 +155,9 @@ def ex_index_select_timesteps(x: torch.Tensor, t_idx: torch.Tensor) -> torch.Ten
     return y: (B, K, C)
     """
     # TODO: implement with torch.index_select along time dimension
-    raise NotImplementedError
+
+    return torch.index_select(x, dim=1, index=t_idx)
+    # return x[:, t_idx, :]
 
 
 # ---- broadcasting ----
@@ -133,7 +167,9 @@ def ex_broadcast_row_center(x: torch.Tensor) -> torch.Tensor:
     return x_centered: subtract per-row mean
     """
     # TODO: implement with broadcasting (use keepdim=True)
-    raise NotImplementedError
+    
+    x_mean = x.mean(dim=1).unsqueeze(1) # [B, 1]
+    return x - x_mean
 
 
 def ex_broadcast_pairwise_dist2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -143,7 +179,12 @@ def ex_broadcast_pairwise_dist2(a: torch.Tensor, b: torch.Tensor) -> torch.Tenso
     return dist2: (M, N) squared euclidean distances
     """
     # TODO: implement with broadcasting
-    raise NotImplementedError
+    a = a[:, None, :] # [M, 1, D]
+    b = b[None, :, :] # [1, N, D]
+
+    dist = (a - b)**2 # [M, N, D]
+    dist = torch.sum(dist, dim=-1) # [M, N] 
+    return dist
 
 
 def ex_broadcast_per_head_scale(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -153,7 +194,8 @@ def ex_broadcast_per_head_scale(x: torch.Tensor, scale: torch.Tensor) -> torch.T
     return scaled x where each head h is multiplied by scale[h]
     """
     # TODO: implement with broadcasting only (reshape scale)
-    raise NotImplementedError
+    scale = scale[None, :, None, None] # [1, H, 1, 1]
+    return scale * x
 
 
 # -----------------------------
@@ -302,17 +344,17 @@ def test_broadcast_per_head_scale():
 def main():
     tests = [
         ("gather_pick_one_per_row", test_gather_pick_one_per_row),
-        # ("gather_3d", test_gather_3d),
-        # ("gather_nll", test_gather_nll),
-        # ("scatter_onehot", test_scatter_onehot),
-        # ("scatter_add_hist", test_scatter_add_hist),
-        # ("scatter_reverse_gather", test_scatter_reverse_gather),
-        # ("scatter_bow", test_scatter_bow),
-        # ("index_select_cols", test_index_select_cols),
-        # ("index_select_timesteps", test_index_select_timesteps),
-        # ("broadcast_row_center", test_broadcast_row_center),
-        # ("broadcast_pairwise_dist2", test_broadcast_pairwise_dist2),
-        # ("broadcast_per_head_scale", test_broadcast_per_head_scale),
+        ("gather_3d", test_gather_3d),
+        ("gather_nll", test_gather_nll),
+        ("scatter_onehot", test_scatter_onehot),
+        ("scatter_add_hist", test_scatter_add_hist),
+        ("scatter_reverse_gather", test_scatter_reverse_gather),
+        ("scatter_bow", test_scatter_bow),
+        ("index_select_cols", test_index_select_cols),
+        ("index_select_timesteps", test_index_select_timesteps),
+        ("broadcast_row_center", test_broadcast_row_center),
+        ("broadcast_pairwise_dist2", test_broadcast_pairwise_dist2),
+        ("broadcast_per_head_scale", test_broadcast_per_head_scale),
     ]
     for name, fn in tests:
         run_test(name, fn)
