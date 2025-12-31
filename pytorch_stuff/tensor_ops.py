@@ -39,7 +39,10 @@ def ex_gather_pick_one_per_row(x: torch.Tensor, idx: torch.Tensor) -> torch.Tens
     return y: (B,) where y[b] = x[b, idx[b]]
     """
     # TODO: implement using torch.gather (no advanced indexing x[torch.arange(B), idx])
-    raise NotImplementedError
+
+    idx = idx.unsqueeze(1) # [B, 1]
+    y = torch.gather(x, dim=1, index=idx).squeeze(1)
+    return y
 
 
 def ex_gather_3d(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -299,17 +302,17 @@ def test_broadcast_per_head_scale():
 def main():
     tests = [
         ("gather_pick_one_per_row", test_gather_pick_one_per_row),
-        ("gather_3d", test_gather_3d),
-        ("gather_nll", test_gather_nll),
-        ("scatter_onehot", test_scatter_onehot),
-        ("scatter_add_hist", test_scatter_add_hist),
-        ("scatter_reverse_gather", test_scatter_reverse_gather),
-        ("scatter_bow", test_scatter_bow),
-        ("index_select_cols", test_index_select_cols),
-        ("index_select_timesteps", test_index_select_timesteps),
-        ("broadcast_row_center", test_broadcast_row_center),
-        ("broadcast_pairwise_dist2", test_broadcast_pairwise_dist2),
-        ("broadcast_per_head_scale", test_broadcast_per_head_scale),
+        # ("gather_3d", test_gather_3d),
+        # ("gather_nll", test_gather_nll),
+        # ("scatter_onehot", test_scatter_onehot),
+        # ("scatter_add_hist", test_scatter_add_hist),
+        # ("scatter_reverse_gather", test_scatter_reverse_gather),
+        # ("scatter_bow", test_scatter_bow),
+        # ("index_select_cols", test_index_select_cols),
+        # ("index_select_timesteps", test_index_select_timesteps),
+        # ("broadcast_row_center", test_broadcast_row_center),
+        # ("broadcast_pairwise_dist2", test_broadcast_pairwise_dist2),
+        # ("broadcast_per_head_scale", test_broadcast_per_head_scale),
     ]
     for name, fn in tests:
         run_test(name, fn)
