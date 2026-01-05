@@ -44,14 +44,14 @@ class LinearAttention(nn.Module):
         k = f(k)
         v = f(v)
 
-        # [B, H, N, D, 1] @ [B, H, N, 1, D] -> [B, H, N, D, D] -> [B, H, D, D]
-        kv = (k.unsqueeze(-1) * v.unsqueeze(-1).transpose(-2, -1)).cumsum(dim=-3) 
-        num = q.unsqueeze(-2) @ kv # [B, H, N, 1, D] @ [B, H, N, D, D] -> [B, H, N, 1, D]
+        # [B, H, N, D, 1] * [B, H, N, 1, D] -> [B, H, N, D, D] -> cumsum over N
+        kv_sum = (k.unsqueeze(-1) * v.unsqueeze(-2)).cumsum(dim=2) # [B, H, N, D, D]
+        num = q.unsqueeze(-2) @ kv_sum # [B, H, N, 1, D] @ [B, H, N, D, D] -> [B, H, N, 1, D]
         num = num.squeeze(-2) # [B, H, N, D]
 
-        k_sum = k.cumsum(dim=-2).unsqueeze(-1) # [B, H, N, D, 1]
-        den = q.unsqueeze(-1).transpose(-2, -1) @ k_sum # [B, H, N, 1, D] @ [B, H, N, D, 1] -> [B, H, N, 1]
-        den = den.squeeze(-1) + 1e-5 # [B, H, N, 1]
+        k_sum = k.cumsum(dim=2).unsqueeze(-1) # [B, H, N, D, 1]
+        den = q.unsqueeze(-2) @ k_sum # [B, H, N, 1, D] @ [B, H, N, D, 1] -> [B, H, N, 1, 1]
+        den = den.squeeze(-1).squeeze(-1).unsqueeze(-1) + 1e-5 # [B, H, N, 1]
 
         y = num / den
 
@@ -75,11 +75,11 @@ class LinearAttention(nn.Module):
         k = f(k)
         v = f(v)
 
-        kv = kv + (k.transpose(-2, -1) @ v) # [B, H, D, 1] @ [B, H, 1, D] # O(D^2) cost during inference
+        kv = kv + (k.transpose(-2, -1) @ v) # [B, H, D, 1] @ [B, H, 1, D] -> [B, H, D, D], O(D^2) cost during inference
         k_sum = k_sum + k.transpose(-2, -1) # [B, H, D, 1]
 
-        num = q @ kv # [B, H, 1, D]
-        den = q @ k_sum + 1e-5 # [B, H, 1, D]
+        num = q @ kv # [B, H, 1, D] @ [B, H, D, D] -> [B, H, 1, D]
+        den = q @ k_sum + 1e-5 # [B, H, 1, D] @ [B, H, D, 1] -> [B, H, 1, 1]
 
         y = num / den
         y = einops.rearrange(y, "b h n d -> b n (h d)")
