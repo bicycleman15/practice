@@ -210,3 +210,5 @@ dataset/tiny_stories
 
 optimizer/data
 optimizer/*.png
+
+prob/*.png
