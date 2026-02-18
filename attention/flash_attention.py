@@ -98,7 +98,7 @@ def flash_attention_backward_rowwise(q, k, v, scale, do, o, sum_denom, max_logit
 
 
 @torch.no_grad()
-def flash_attention_backward_rowwise(q, k, v, scale, do, o, sum_denom, max_logit):
+def flash_attention_backward(q, k, v, scale, do, o, sum_denom, max_logit):
     
     # q: [B, H, N, D]
     N = q.shape[2]
@@ -110,36 +110,41 @@ def flash_attention_backward_rowwise(q, k, v, scale, do, o, sum_denom, max_logit
     # compute helper scalar for ds
     helper_scalar = torch.sum(do * o, dim=-1, keepdim=True) # [:, :, N, 1]
 
-    for i in range(N):
+    query_block_size = 16
+
+    for i in range(0, N, query_block_size):
+
+        q_tile = q[:, :, i:i+query_block_size] # [:, :, Q, D]
+
+        sum_row = sum_denom[:, :, i:i+query_block_size] # [:, :, Q, 1]
+        max_row = max_logit[:, :, i:i+query_block_size]
+
+        cur_do = do[:, :, i:i+query_block_size] # [:, :, Q, D]
+
+        cur_helper_scalar = helper_scalar[:, :, i:i+query_block_size] # [:, :, Q, 1]
 
         block_size = 16
-
-        q_tile = q[:, :, i:i+1] # [:, :, 1, D]
-
-        sum_row = sum_denom[:, :, i:i+1] # [:, :, 1, 1]
-        max_row = max_logit[:, :, i:i+1]
-
-        cur_do = do[:, :, i:i+1] # [:, :, 1, D]
-
-        cur_helper_scalar = helper_scalar[:, :, i:i+1] # [:, :, 1, 1]
 
         for j in range(0, N, block_size):
 
             k_tile = k[:, :, j:j+block_size]
             v_tile = v[:, :, j:j+block_size]
 
-            s = q_tile @ k_tile.transpose(-1, -2) / scale # [:, :, 1, T]
-            p = torch.exp(s - max_row) / sum_row
+            s = q_tile @ k_tile.transpose(-1, -2) / scale # [:, :, Q, T]
+            p = torch.exp(s - max_row) / sum_row # [:, :, Q, T]
 
-            dv[:, :, j:j+block_size] += p.transpose(-1, -2) @ cur_do # [:, :, T, D]
+            # each query (independently) will contribute some gradient back to V
+            dv[:, :, j:j+block_size] += p.transpose(-1, -2) @ cur_do # [:, :, T, Q] @ [:, :, Q, D] = [:, :, T, D] -- independently for all queries
 
-            dp = cur_do @ v_tile.transpose(-1, -2) # [:, :, 1, T]
+            dp = cur_do @ v_tile.transpose(-1, -2) # [:, :, Q, D] @ [:, :, D, T] = [:, :, Q, T] -- independently for all queries
 
-            ds = dp * p - cur_helper_scalar * p # [:, :, 1, T]
+            # we did earlier did rowwise ops below, now there are just done in parallel for all queries
+            ds = dp * p - cur_helper_scalar * p # [:, :, Q, T]
 
+            # each query (independently) will contribute some gradient back to K
             dk[:, :, j:j+block_size] += ds.transpose(-1, -2) @ q_tile / scale # [:, :, T, D]
 
-            dq[:, :, i:i+1] += ds @ k_tile / scale # [:, :, 1, D]
+            dq[:, :, i:i+query_block_size] += ds @ k_tile / scale # [:, :, 1, D]
 
     return dq, dk, dv
 
@@ -148,7 +153,7 @@ if __name__ == "__main__":
 
     B, H, N, D = 8, 2, 512, 64
 
-    for _ in trange(1):
+    for _ in trange(10):
 
         # Create tensors with gradients enabled for autograd comparison
         q = torch.randn((B, H, N, D), requires_grad=True)
@@ -181,7 +186,11 @@ if __name__ == "__main__":
         dv_ref = v.grad.clone()
 
         # Compute gradients using custom backward (use detached tensors)
-        dq, dk, dv = flash_attention_backward_rowwise(
+        # dq, dk, dv = flash_attention_backward_rowwise(
+        #     q.detach(), k.detach(), v.detach(), scale, do, out, den_sum, max_logit
+        # )
+        # now test blocked bwd for queries
+        dq, dk, dv = flash_attention_backward(
             q.detach(), k.detach(), v.detach(), scale, do, out, den_sum, max_logit
         )
 
