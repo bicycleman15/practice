@@ -97,6 +97,53 @@ def flash_attention_backward_rowwise(q, k, v, scale, do, o, sum_denom, max_logit
     return dq, dk, dv
 
 
+@torch.no_grad()
+def flash_attention_backward_rowwise(q, k, v, scale, do, o, sum_denom, max_logit):
+    
+    # q: [B, H, N, D]
+    N = q.shape[2]
+
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(q)
+    dv = torch.zeros_like(q)
+
+    # compute helper scalar for ds
+    helper_scalar = torch.sum(do * o, dim=-1, keepdim=True) # [:, :, N, 1]
+
+    for i in range(N):
+
+        block_size = 16
+
+        q_tile = q[:, :, i:i+1] # [:, :, 1, D]
+
+        sum_row = sum_denom[:, :, i:i+1] # [:, :, 1, 1]
+        max_row = max_logit[:, :, i:i+1]
+
+        cur_do = do[:, :, i:i+1] # [:, :, 1, D]
+
+        cur_helper_scalar = helper_scalar[:, :, i:i+1] # [:, :, 1, 1]
+
+        for j in range(0, N, block_size):
+
+            k_tile = k[:, :, j:j+block_size]
+            v_tile = v[:, :, j:j+block_size]
+
+            s = q_tile @ k_tile.transpose(-1, -2) / scale # [:, :, 1, T]
+            p = torch.exp(s - max_row) / sum_row
+
+            dv[:, :, j:j+block_size] += p.transpose(-1, -2) @ cur_do # [:, :, T, D]
+
+            dp = cur_do @ v_tile.transpose(-1, -2) # [:, :, 1, T]
+
+            ds = dp * p - cur_helper_scalar * p # [:, :, 1, T]
+
+            dk[:, :, j:j+block_size] += ds.transpose(-1, -2) @ q_tile / scale # [:, :, T, D]
+
+            dq[:, :, i:i+1] += ds @ k_tile / scale # [:, :, 1, D]
+
+    return dq, dk, dv
+
+
 if __name__ == "__main__":
 
     B, H, N, D = 8, 2, 512, 64
