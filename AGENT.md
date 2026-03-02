@@ -1,0 +1,1 @@
+source ~/.zshrc and then perform conda activate t3 before running any command.
