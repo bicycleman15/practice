@@ -56,6 +56,13 @@ class NonLinearLinearRNNConfig:
     # The model is free to learn any value afterwards; this only moves the start.
     decay_init: str = "mild"
 
+    # If True, beta <- 2 * sigmoid(.) (range (0, 2)) so the per-token Householder
+    # factor (I - beta k k^T) can have eigenvalues in (-1, 1) along k instead of
+    # (0, 1). This is the "Unlocking State-Tracking via Negative Eigenvalues"
+    # trick (Grazzi et al. 2024) and is required for DeltaNet to even solve
+    # parity, let alone harder group word problems.
+    allow_neg_eigval: bool = False
+
 
 # ---------------------------------------------------------------------------
 # utilities
@@ -143,7 +150,7 @@ class ShortConv(nn.Module):
             kernel_size=kernel_size,
             groups=dim,
             padding=kernel_size - 1,
-            bias=True,
+            bias=False,
         )
 
     def forward(self, x):
@@ -387,6 +394,9 @@ class NonLinearLinearRNNAttn(nn.Module):
         k = l2_norm(k)
 
         beta = torch.sigmoid(self.beta_proj(x))                   # (B, L, H)
+        if self.config.allow_neg_eigval:
+            # beta in (0, 2) -> eigenvalue of (I - beta k k^T) along k in (-1, 1)
+            beta = 2.0 * beta
         beta = einops.rearrange(beta, "b l h -> b h l")
 
         gk_raw = self.gk_proj(x)                                   # (B, L, H)

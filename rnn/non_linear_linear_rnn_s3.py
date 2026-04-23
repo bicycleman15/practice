@@ -100,9 +100,9 @@ class S3Config:
     L_eval: tuple = (64, 128, 256, 512)
 
     # training
-    batch_size: int = 64
-    steps: int = 4000
-    lr: float = 1e-3
+    batch_size: int = 256
+    steps: int = 5000
+    lr: float = 1e-4
     seed: int = 0
     log_every: int = 100
 
@@ -124,9 +124,18 @@ class S3Config:
     # Short conv gives a local-window view (kernel 4) that the model can use
     # to compute within-chunk partial products cheaply before the boundary.
     use_short_conv: bool = True
+    # Allow the per-token Householder factor (I - beta k k^T) to have negative
+    # eigenvalues (beta in (0, 2) instead of (0, 1)). This is strictly
+    # necessary for *any* non-trivial group word problem: with beta in (0, 1)
+    # the state-transition eigenvalues are all in (0, 1) and a finite-precision
+    # linear RNN provably cannot even solve parity (Grazzi et al. 2024,
+    # "Unlocking State-Tracking in Linear RNNs Through Negative Eigenvalues",
+    # arXiv:2411.12537). This is a prerequisite for S_3; solving S_3 in one
+    # layer additionally needs >=2 Householders per token (DeltaProduct).
+    allow_neg_eigval: bool = True
 
     # which boundary non-linearities to sweep
-    variants: tuple = ("identity", "rmsnorm", "tanh_res", "gru")
+    variants: tuple = ("identity", "rmsnorm", "gru")
 
 
 def _pick_device():
@@ -156,12 +165,13 @@ def run_variant(boundary_nonlin: str, cfg: S3Config, device: str):
         boundary_nonlin=boundary_nonlin,
         use_short_conv=cfg.use_short_conv,
         decay_init=cfg.decay_init,
+        allow_neg_eigval=cfg.allow_neg_eigval,
     )
     model = NonLinearLinearRNNLM(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
 
     desc = f"S3 [{boundary_nonlin:<9s}]"
-    bar = tqdm(range(cfg.steps), desc=desc, mininterval=0.5, miniters=cfg.log_every)
+    bar = tqdm(range(cfg.steps), desc=desc, mininterval=0.5)
 
     model.train()
     for step in bar:
@@ -172,13 +182,13 @@ def run_variant(boundary_nonlin: str, cfg: S3Config, device: str):
         )
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        if (step + 1) % cfg.log_every == 0 or step == cfg.steps - 1:
-            with torch.no_grad():
-                acc = (logits.argmax(-1) == target_ids).float().mean().item()
-            bar.set_postfix_str(f"loss={loss.item():.3f} acc={acc:.2%}")
+        # if (step + 1) % cfg.log_every == 0 or step == cfg.steps - 1:
+        with torch.no_grad():
+            acc = (logits.argmax(-1) == target_ids).float().mean().item()
+        bar.set_postfix_str(f"loss={loss.item():.3f} acc={acc:.2%} grad_norm={grad_norm:.3f}")
 
     # Eval on each length; also measure the last-position accuracy specifically
     # because that's the hardest position (requires the full running product).
@@ -210,7 +220,8 @@ def main():
     print(f"S_3 state-tracking | train L={cfg.L_train}  eval L={list(cfg.L_eval)}")
     print(
         f"dim={cfg.dim}  heads={cfg.num_heads}  layers={cfg.layers}  "
-        f"chunk_size={cfg.chunk_size}  (train chunks={cfg.L_train // cfg.chunk_size})"
+        f"chunk_size={cfg.chunk_size}  (train chunks={cfg.L_train // cfg.chunk_size})  "
+        f"allow_neg_eigval={cfg.allow_neg_eigval}"
     )
     print(f"random-guess accuracy: {1 / 6:.2%}\n")
 
