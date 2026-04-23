@@ -101,8 +101,8 @@ class S3Config:
 
     # training
     batch_size: int = 256
-    steps: int = 5000
-    lr: float = 1e-4
+    steps: int = 3000
+    lr: float = 1e-2
     seed: int = 0
     log_every: int = 100
 
@@ -113,7 +113,7 @@ class S3Config:
     num_heads: int = 2
     head_k_dim: int = 24
     head_v_dim: int = 24
-    layers: int = 2
+    layers: int = 1
     chunk_size: int = 4
     vocab_size: int = 6
 
@@ -135,7 +135,8 @@ class S3Config:
     allow_neg_eigval: bool = True
 
     # which boundary non-linearities to sweep
-    variants: tuple = ("identity", "rmsnorm", "gru")
+    # variants: tuple = ("identity", "rmsnorm", "gru", "gru_input")
+    variants: tuple = ("gru_input",)
 
 
 def _pick_device():

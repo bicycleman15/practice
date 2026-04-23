@@ -79,10 +79,16 @@ def l2_norm(x, eps=1e-6):
 
 
 class BoundaryNonlinearity(nn.Module):
-    """f(S) applied to the recurrent state at chunk boundaries.
+    """f(S, c) applied to the recurrent state at chunk boundaries.
 
     S has shape (B, H, K, V). All variants preserve the shape.
+    c (optional) has shape (B, H, V) — a per-chunk conditioning vector, only
+    used by input-conditioned variants (`gru_input`). Non-conditioned variants
+    ignore `c`.
     """
+
+    #: variants that require the per-chunk conditioning `c` to be passed in.
+    INPUT_CONDITIONED = ("gru_input",)
 
     def __init__(self, kind: str, num_heads: int, head_k_dim: int, head_v_dim: int):
         super().__init__()
@@ -109,10 +115,35 @@ class BoundaryNonlinearity(nn.Module):
             # Start z near 1 so the gate is almost pass-through at init.
             self.b_z = nn.Parameter(torch.full((num_heads, 1, 1), 3.0))
             self.b_h = nn.Parameter(torch.zeros(num_heads, 1, 1))
+        elif kind == "gru_input":
+            # Input-conditioned GRU. Same structure as `gru` but the gate and
+            # candidate also depend on a per-chunk input vector c (B, H, V):
+            #   z = sigmoid(b_z + c @ W_xz + S @ W_z)
+            #   h = tanh(   b_h + c @ W_xh + S @ W_h)
+            #   S_new = z * S + (1 - z) * h
+            # Broadcasting puts c on the K axis: the same c influences every
+            # row of S within a head. This is what the boundary needs in order
+            # to implement an input-conditioned state update (e.g. group
+            # multiplication by the chunk's "net element").
+            #
+            # Note: unlike the plain `gru` variant we do NOT bias the gate
+            # toward pass-through (b_z = 3 there → z ≈ 0.95 at init). With
+            # input conditioning the whole point is that the candidate h
+            # should actually contribute to S_new, and a near-closed gate
+            # attenuates gradient into c_proj / W_xz / W_xh by ~20x and into
+            # the gate weights themselves by ~5x. Start the gate balanced.
+            scale = 1.0 / math.sqrt(head_v_dim)
+            self.W_z  = nn.Parameter(torch.randn(num_heads, head_v_dim, head_v_dim) * scale)
+            self.W_h  = nn.Parameter(torch.randn(num_heads, head_v_dim, head_v_dim) * scale)
+            self.W_xz = nn.Parameter(torch.randn(num_heads, head_v_dim, head_v_dim) * scale)
+            self.W_xh = nn.Parameter(torch.randn(num_heads, head_v_dim, head_v_dim) * scale)
+            # self.b_z  = nn.Parameter(torch.full((num_heads, 1, 1), 3.0))
+            self.b_z  = nn.Parameter(torch.zeros(num_heads, 1, 1))
+            self.b_h  = nn.Parameter(torch.zeros(num_heads, 1, 1))
         else:
             raise ValueError(f"unknown boundary_nonlin kind: {kind}")
 
-    def forward(self, S):
+    def forward(self, S, c=None):
         if self.kind == "identity":
             return S
         if self.kind == "rmsnorm":
@@ -124,6 +155,14 @@ class BoundaryNonlinearity(nn.Module):
         if self.kind == "gru":
             z = torch.sigmoid(self.b_z[None] + torch.einsum("bhkv,hvu->bhku", S, self.W_z))
             h = torch.tanh(self.b_h[None] + torch.einsum("bhkv,hvu->bhku", S, self.W_h))
+            return z * S + (1.0 - z) * h
+        if self.kind == "gru_input":
+            assert c is not None, "gru_input requires per-chunk conditioning c"
+            # c: (B, H, V) -> (B, H, 1, V) so it broadcasts over the K axis of S.
+            cWz = torch.einsum("bhv,hvu->bhu", c, self.W_xz)[:, :, None, :]
+            cWh = torch.einsum("bhv,hvu->bhu", c, self.W_xh)[:, :, None, :]
+            z = torch.sigmoid(self.b_z[None] + cWz + torch.einsum("bhkv,hvu->bhku", S, self.W_z))
+            h = torch.tanh(   self.b_h[None] + cWh + torch.einsum("bhkv,hvu->bhku", S, self.W_h))
             return z * S + (1.0 - z) * h
         raise RuntimeError("unreachable")
 
@@ -181,7 +220,7 @@ class ShortConv(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def delta_rule_recurrent(q, k, v, beta, gk, S0, f, chunk_size):
+def delta_rule_recurrent(q, k, v, beta, gk, S0, f, chunk_size, boundary_input=None):
     """Token-by-token gated delta rule with f(S) at every `chunk_size`-th token.
 
     Shapes:
@@ -190,6 +229,7 @@ def delta_rule_recurrent(q, k, v, beta, gk, S0, f, chunk_size):
         beta: (B, H, L)         in (0, 1) typically
         gk:   (B, H, L)         per-token log-decay, typically negative
         S0:   (B, H, K, V)      initial state
+        boundary_input: (B, H, N, V) or None   per-chunk conditioning for f
     Returns:
         out:      (B, H, L, V)
         S_final:  (B, H, K, V)
@@ -200,7 +240,9 @@ def delta_rule_recurrent(q, k, v, beta, gk, S0, f, chunk_size):
         dv    = beta_t * (v_t - v_old)
         S   <- S + k_t (outer) dv
         o_t  = S^T q_t
-    And f(S) is invoked whenever (t + 1) % chunk_size == 0.
+    And f(S, c_i) is invoked whenever (t + 1) % chunk_size == 0, with
+    c_i = boundary_input[:, :, i] if boundary_input is not None else None,
+    where i = t // chunk_size is the index of the chunk that just ended.
     """
     B, H, L, K = q.shape
     V = v.shape[-1]
@@ -221,7 +263,8 @@ def delta_rule_recurrent(q, k, v, beta, gk, S0, f, chunk_size):
         outputs.append(o_t)
 
         if (t + 1) % chunk_size == 0:
-            S = f(S)
+            c_i = boundary_input[:, :, t // chunk_size] if boundary_input is not None else None
+            S = f(S, c_i)
 
     out = torch.stack(outputs, dim=2)  # (B, H, L, V)
     return out, S
@@ -232,7 +275,7 @@ def delta_rule_recurrent(q, k, v, beta, gk, S0, f, chunk_size):
 # ---------------------------------------------------------------------------
 
 
-def delta_rule_chunked(q, k, v, beta, gk, S0, f, chunk_size):
+def delta_rule_chunked(q, k, v, beta, gk, S0, f, chunk_size, boundary_input=None):
     """Chunked gated delta rule. Intra-chunk is linear/parallel (WY form);
     f(S) is applied only in the inter-chunk transition.
 
@@ -309,7 +352,8 @@ def delta_rule_chunked(q, k, v, beta, gk, S0, f, chunk_size):
 
         rC = r_total[:, :, i].unsqueeze(-1)                   # (B, H, 1, 1)
         S_new = rC * S + rC * (K_down[:, :, i].transpose(-1, -2) @ Ui)
-        S = f(S_new)
+        c_i = boundary_input[:, :, i] if boundary_input is not None else None
+        S = f(S_new, c_i)
 
     out = torch.cat(outs, dim=2)  # (B, H, L, V)
     return out, S
@@ -351,6 +395,13 @@ class NonLinearLinearRNNAttn(nn.Module):
             config.head_k_dim,
             config.head_v_dim,
         )
+
+        # For input-conditioned boundary variants we also project the chunk's
+        # "summary token" (last x in the chunk) into a per-head, V-dim vector c
+        # that is handed to f(S, c). Built only when needed.
+        self.needs_boundary_input = config.boundary_nonlin in BoundaryNonlinearity.INPUT_CONDITIONED
+        if self.needs_boundary_input:
+            self.c_proj = nn.Linear(config.dim, v_total, bias=True)
 
         # GDN-style log-decay init: gk = -exp(A_log) * softplus(gk_raw + dt_bias).
         # "mild":   gk/token ~ -1e-4  (state preserved long after chunk end)
@@ -406,7 +457,22 @@ class NonLinearLinearRNNAttn(nn.Module):
         if S0 is None:
             S0 = torch.zeros(B, H, K, V, device=x.device, dtype=q.dtype)
 
-        out, S_final = delta_rule_chunked(q, k, v, beta, gk, S0, self.boundary, self.chunk_size)
+        # Build per-chunk boundary input from the "summary token" of each chunk
+        # (last x in the chunk). Shape: (B, H, N, V). Requires L % chunk_size == 0,
+        # which the kernel also requires.
+        boundary_input = None
+        if self.needs_boundary_input:
+            C = self.chunk_size
+            assert L % C == 0, f"L={L} not divisible by chunk_size={C}"
+            N = L // C
+            x_last = x.reshape(B, N, C, -1)[:, :, -1, :]           # (B, N, D)
+            c = self.c_proj(x_last)                                 # (B, N, H*V)
+            boundary_input = einops.rearrange(c, "b n (h v) -> b h n v", h=H)
+
+        out, S_final = delta_rule_chunked(
+            q, k, v, beta, gk, S0, self.boundary, self.chunk_size,
+            boundary_input=boundary_input,
+        )
         out = einops.rearrange(out, "b h l v -> b l (h v)")
         out = self.o_proj(out)
         return out, S_final
@@ -466,9 +532,10 @@ def _test_shapes():
 
 
 def _test_equivalence():
-    print("=== equivalence test: chunked vs recurrent, f=identity, fp64 ===")
+    print("=== equivalence test: chunked vs recurrent, fp64 ===")
     torch.manual_seed(0)
     B, H, L, K, V, C = 2, 2, 32, 8, 8, 8
+    N = L // C
 
     q = l2_norm(torch.randn(B, H, L, K, dtype=torch.float64) * 0.5)
     k = l2_norm(torch.randn(B, H, L, K, dtype=torch.float64) * 0.5)
@@ -478,23 +545,31 @@ def _test_equivalence():
     gk = -F.softplus(torch.randn(B, H, L, dtype=torch.float64)) * 0.1
     S0 = torch.zeros(B, H, K, V, dtype=torch.float64)
 
+    # identity: no conditioning needed.
     f = BoundaryNonlinearity("identity", H, K, V).double()
-
     out_ref, S_ref = delta_rule_recurrent(q, k, v, beta, gk, S0, f, C)
     out_chu, S_chu = delta_rule_chunked(q, k, v, beta, gk, S0, f, C)
+    print(f"  identity    max out diff: {(out_ref - out_chu).abs().max().item():.2e}"
+          f"   max S diff: {(S_ref - S_chu).abs().max().item():.2e}")
+    assert torch.allclose(out_ref, out_chu, atol=1e-8, rtol=1e-6), "chunked disagrees with recurrent (identity)"
+    assert torch.allclose(S_ref, S_chu, atol=1e-8, rtol=1e-6)
 
-    out_diff = (out_ref - out_chu).abs().max().item()
-    S_diff = (S_ref - S_chu).abs().max().item()
-    print(f"  max out diff: {out_diff:.2e}")
-    print(f"  max S   diff: {S_diff:.2e}")
-    assert torch.allclose(out_ref, out_chu, atol=1e-8, rtol=1e-6), "chunked disagrees with recurrent"
+    # gru_input: same random per-chunk conditioning in both kernels.
+    torch.manual_seed(1)
+    f = BoundaryNonlinearity("gru_input", H, K, V).double()
+    boundary_input = torch.randn(B, H, N, V, dtype=torch.float64)
+    out_ref, S_ref = delta_rule_recurrent(q, k, v, beta, gk, S0, f, C, boundary_input=boundary_input)
+    out_chu, S_chu = delta_rule_chunked(q, k, v, beta, gk, S0, f, C, boundary_input=boundary_input)
+    print(f"  gru_input   max out diff: {(out_ref - out_chu).abs().max().item():.2e}"
+          f"   max S diff: {(S_ref - S_chu).abs().max().item():.2e}")
+    assert torch.allclose(out_ref, out_chu, atol=1e-8, rtol=1e-6), "chunked disagrees with recurrent (gru_input)"
     assert torch.allclose(S_ref, S_chu, atol=1e-8, rtol=1e-6)
     print("  pass")
 
 
 def _test_training_all_variants():
     print("=== training smoke test (all boundary_nonlin x use_short_conv) ===")
-    for kind in ["identity", "rmsnorm", "tanh_res", "gru"]:
+    for kind in ["identity", "rmsnorm", "tanh_res", "gru", "gru_input"]:
         for use_conv in [True, False]:
             torch.manual_seed(0)
             config = NonLinearLinearRNNConfig(
