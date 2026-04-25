@@ -104,7 +104,7 @@ class SnConfig:
     # training
     batch_size: int = 256
     steps: int = 5000
-    lr: float = 1e-2
+    lr: float = 4e-2
     seed: int = 0
     log_every: int = 100
 
@@ -130,9 +130,14 @@ class SnConfig:
     # problems (Grazzi et al. 2024); see module docstring.
     allow_neg_eigval: bool = True
 
-    # which boundary non-linearities to sweep
-    # variants: tuple = ("identity", "rmsnorm", "gru", "gru_input")
-    variants: tuple = ("gru_input",)
+    # Top-level architecture: "linear_chunks" (delta-rule WY kernel + boundary
+    # non-linearity) or "m2rnn" (pure M²RNN per-token recurrence). When
+    # "m2rnn", `variants` and `chunk_size` are ignored.
+    architecture: str = "m2rnn"
+
+    # boundary non-linearities to sweep — only used when architecture="linear_chunks"
+    # variants: tuple = ("identity", "rmsnorm", "gru", "gru_input", "m2rnn")
+    variants: tuple = ("m2rnn",)
 
 
 def _pick_device():
@@ -164,11 +169,13 @@ def run_variant(boundary_nonlin: str, cfg: SnConfig, cayley_t: torch.Tensor,
         use_short_conv=cfg.use_short_conv,
         decay_init=cfg.decay_init,
         allow_neg_eigval=cfg.allow_neg_eigval,
+        architecture=cfg.architecture,
     )
     model = NonLinearLinearRNNLM(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
 
-    desc = f"S{cfg.group_n} [{boundary_nonlin:<9s}]"
+    tag = cfg.architecture if cfg.architecture == "m2rnn" else boundary_nonlin
+    desc = f"S{cfg.group_n} [{tag:<9s}]"
     bar = tqdm(range(cfg.steps), desc=desc, mininterval=0.5)
 
     model.train()
@@ -230,15 +237,29 @@ def main():
         f"S_{cfg.group_n} state-tracking | |S_{cfg.group_n}|={vocab_size}  "
         f"train L={cfg.L_train}  eval L={list(cfg.L_eval)}"
     )
-    print(
-        f"dim={cfg.dim}  heads={cfg.num_heads}  layers={cfg.layers}  "
-        f"chunk_size={cfg.chunk_size}  (train chunks={cfg.L_train // cfg.chunk_size})  "
-        f"allow_neg_eigval={cfg.allow_neg_eigval}"
-    )
+    if cfg.architecture == "m2rnn":
+        print(
+            f"architecture=m2rnn (pure non-linear RNN per token; chunk_size and "
+            f"boundary_nonlin are ignored)"
+        )
+        print(
+            f"dim={cfg.dim}  heads={cfg.num_heads}  layers={cfg.layers}  "
+            f"head_k_dim={cfg.head_k_dim}  head_v_dim={cfg.head_v_dim}"
+        )
+    else:
+        print(
+            f"architecture=linear_chunks  dim={cfg.dim}  heads={cfg.num_heads}  "
+            f"layers={cfg.layers}  chunk_size={cfg.chunk_size}  "
+            f"(train chunks={cfg.L_train // cfg.chunk_size})  "
+            f"allow_neg_eigval={cfg.allow_neg_eigval}"
+        )
     print(f"random-guess accuracy: {1 / vocab_size:.2%}\n")
 
+    # When architecture=m2rnn, boundary_nonlin is unused; we still loop once
+    # so the existing report machinery works.
+    variants_to_run = cfg.variants if cfg.architecture == "linear_chunks" else ("m2rnn",)
     results = {}
-    for kind in cfg.variants:
+    for kind in variants_to_run:
         results[kind] = run_variant(
             kind, cfg, cayley_t, identity_idx, vocab_size, device
         )
