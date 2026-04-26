@@ -508,3 +508,306 @@ wrong knob.
 | `linear_chunks/gru_input`, cs=1 | ~2.4%, plateau | input contribution is broadcast across K, can't address rows; can't learn input-conditioned permutations |
 | `linear_chunks/m2rnn`, cs=1 | ~2.3%, plateau | rank-1 input fixed, but delta-rule + m2rnn-boundary = two redundant rank-1 writes per token; optimizer can't disentangle |
 | `architecture="m2rnn"`, true M²RNN | (running) | should work — single coherent rank-1 update per token, matches the reference architecture that demonstrably solves S_5 |
+
+
+## 8. The `m2rnn_full_block` trap on state-tracking
+
+After getting the recurrence right (Section 7), we still trailed the
+reference badly on S_3 with matched capacity (dim=384, heads=12, lr=1e-3,
+train L=16):
+
+| | L=16 | L=32 | L=64 | L=128 |
+|---|---|---|---|---|
+| ours, full_block=True, identity W | 57.86% | 37.11% | 27.15% | 21.70% |
+| ours, full_block=True, Xavier W   | 68.48% | 50.56% | 41.83% | 38.09% |
+| ours, full_block=False, Xavier W  | **>97%** at 60% of training | — | — | — |
+| ref_m2rnn                         | 99.29% | 93.32% | 64.92% | 43.38% |
+
+Two changes closed the gap:
+
+### 8.1 W init: identity → Xavier-normal `std=1/sqrt(V)`
+
+Before (paper-style):
+```python
+W_init = torch.eye(V).unsqueeze(0).repeat(N, 1, 1)
+self.W = nn.Parameter(W_init)
+```
+
+After (matches reference):
+```python
+self.W = nn.Parameter(torch.empty(N, V, V))
+nn.init.normal_(self.W, mean=0.0, std=1.0 / math.sqrt(V))
+```
+
+Worth ~10 points at L=16. Same spectral-radius scale as identity at init,
+but lets the model mix the V axis from step 0 instead of having to learn
+deviations from a no-op.
+
+### 8.2 The real culprit: `m2rnn_full_block`
+
+The paper's full block (Eq. 20-21) wraps the M²RNN readout in three extra
+operations:
+
+```python
+# What we had (full_block=True):
+y = y + self.w_r[None, None, :, :] * v        # value residual
+y = y.flatten(-2, -1)                         # (B, L, N*V)
+g = F.silu(self.g_proj(x))                    # output gate, input-only
+y = self.out_norm(y * g)                      # RMSNorm before o_proj
+out = self.o_proj(y)
+
+# What the open-source ref does (and what works for S_n):
+y = y.flatten(-2, -1)
+out = self.o_proj(y)
+```
+
+Each of the three "improvements" actively hurts state-tracking:
+
+| component | math | why it hurts state-tracking |
+|---|---|---|
+| **output gate** | `y ← SiLU(W_g x_t) ⊙ y` | `g(x_t)` is a function of the **current** token only. The S_n target depends on the running product over **all** past tokens. Multiplying the readout by a per-step input-only gate scrambles the accumulated signal — the model has to fight to keep `g ≈ 1`. |
+| **value residual** | `y ← y + w_r ⊙ v_t` | Injects the **current** `v_t` directly into the output, biasing the readout toward the latest token rather than the state `H_t`. For S_n the answer at `t` depends on the product `g_1 ⋯ g_t`; adding `v_t` is pure noise w.r.t. the target. |
+| **RMSNorm before `o_proj`** | `y ← RMSNorm(y)` | Per-step input-independent magnitude rescaling of the readout. Compounds the above; the state's effective scale is reset each step. |
+
+The recurrence itself was already correct. We just needed to stop
+"improving" the readout. Fix:
+
+```python
+# rnn/non_linear_linear_rnn.py
+m2rnn_full_block: bool = False   # was True
+```
+
+### 8.3 When *would* you want a value residual?
+
+Useful when the **target depends heavily on the current token / recent
+context** and the state is auxiliary background:
+
+1. **Language modeling.** Next-token is overwhelmingly predicted by the
+   last few tokens. Letting `v_t` skip the recurrent state gives a direct
+   path for "what was just said"; the state only adds long-range context
+   on top. RWKV-7, GLA, the M²RNN paper, and the "value residual learning"
+   line all use it for LM.
+2. **Compression-bottlenecked architectures.** Linear attention/RNNs
+   compress unbounded history into a fixed-size `H ∈ ℝ^{K×V}`. Reading
+   `q_t^T H_t` is lossy. If the prediction at `t` mostly needs `v_t`
+   itself (copy, induction-head completion), forcing it through the state
+   bottleneck wastes capacity. The residual is a cheap escape valve.
+3. **Deep stacks.** Cross-layer value residuals ("Value Residual Learning
+   For Alleviating Attention Concentration") give the first-layer `v` a
+   direct path into deeper layers, mitigating the "deep layers forget what
+   tokens were" problem.
+4. **Translation / seq2seq.** Each output token aligns to a small input
+   window; the current-token `v` is more informative than the running
+   state.
+
+Useless or harmful when the **state is the answer**:
+
+- State tracking (S_n, parity, group word problems): the target is the
+  running product, not anything intrinsic to `x_t`.
+- Any task where `P(y_t | x_t) ≈ P(y_t)` (current token alone tells you
+  almost nothing about the answer).
+
+Rule of thumb:
+
+```
+P(y_t | x_t) ≈ P(y_t | x_1..x_t)  →  value residual helps  (LM, copy, retrieval)
+P(y_t | x_t) ≈ P(y_t)             →  value residual hurts (S_n, parity, group products)
+```
+
+How much does the **current token alone** narrow the answer? High → free
+win. Near-zero → dead weight at best, distraction at worst. The same
+logic applies to the input-only output gate `g(x_t)`: fine when the
+current token is informative, harmful when the state has to dominate.
+
+### 8.4 Smaller deltas vs the reference (still in our impl, harmless)
+
+For the record, after dropping `full_block`, we still differ from the
+open-source reference in three minor ways:
+
+- **ShortConv (Conv1d + SiLU) on q/k/v.** Local-window pre-mixing.
+- **`f = sigmoid(f_proj(x))`** vs the reference's raw `f` (unbounded).
+- **Per-step elementwise gradient clip on `H`** (matches the reference's
+  `clip_gradients` STE helper, which we kept).
+
+None of these blocked S_3; the curve tracks the reference once
+`full_block=False`.
+
+---
+
+## 9. When does the boundary nonlinearity actually help?
+
+After getting M²RNN to work, the natural follow-up was: forget the
+architecture comparison — for the original proposal (linear delta-rule
+kernel + nonlinearity at chunk boundaries), **on what task does the
+nonlinearity earn its keep?** We swept three tasks.
+
+### 9.1 S_3 state tracking — nonlinearity does not help
+
+`linear_chunks`, `chunk_size=4`, sweep `boundary_nonlin ∈
+{identity, rmsnorm, tanh_res, gru}`:
+
+| variant | L=16 | L=32 | L=64 |
+|---|---|---|---|
+| **identity** | **~92%** | **~78%** | **~62%** |
+| rmsnorm | ~85% | ~70% | ~55% |
+| tanh_res | ~88% | ~72% | ~58% |
+| gru | ~89% | ~74% | ~59% |
+
+`identity` wins. S_n is a **regular** language: there's a finite-state
+DFA of size `|S_n|` that solves it, and a linear-in-state RNN with
+`state_dim ≥ |S_n|` can encode that DFA exactly as a transition-matrix
+product (negative-eigenvalue β does the rest). Adding a nonlinearity at
+the boundary just adds optimization noise — it can't expand the
+expressivity class because the class is already enough.
+
+### 9.2 Saturated counter — also DFA, also linear-solvable
+
+To force a saturation event we built `non_linear_linear_rnn_satcount.py`:
+counter that increments / decrements / holds with hard `[−K, K]` bounds.
+Initially `K=8, L=16` was trivial (random walk almost never saturates →
+task degenerates to running signed sum, which is *literally* linear).
+Reduced to `K=2`. Result:
+
+| variant | L=16 | L=32 | L=64 | L=128 |
+|---|---|---|---|---|
+| identity | 100% | 99.4% | 96.8% | 89.1% |
+| rmsnorm | 99.9% | 99.0% | 95.5% | 87.3% |
+| ... | | | | |
+
+Still trivially solvable by linear. **A saturated counter with K states
+is a DFA with K states.** The model represents each counter state as a
+basis vector of S, and increments are 1-step shifts in that subspace —
+all linear. The "saturation" nonlinearity that hits at the boundary is
+already encodable as a transition matrix `M_+` whose `K`-th column is
+zero. No `tanh` or `gru` at the boundary needed.
+
+**Lesson:** any task expressible as a finite-state DFA is in principle
+within reach of a linear-in-state RNN with enough state dim. "Looks
+nonlinear" (clipping, saturation, modular arithmetic, group products) is
+not the same as "needs a non-linear recurrence."
+
+### 9.3 Dyck-2 stack-top — the real wall
+
+Switched to a **strictly non-regular** task: predict the stack-top symbol
+of a Dyck-2 (balanced `()`, `[]`) prefix. This is genuinely
+context-free, not regular — no finite DFA can do it, because the stack
+depth is unbounded.
+
+To force the linear ceiling to bite, we:
+- generated **balanced, deep** Dyck-2 with a triangular depth profile
+  peaking at `L/4` (push prob `(L−t)/L`),
+- shrank the model to `dim=64, heads=2, head_k=head_v=16` (matches
+  reference),
+- disabled `use_short_conv` (no local shortcut),
+- reported and early-stopped on **post-pop accuracy** (positions where
+  the stack-top must come from memory, not from the just-seen token).
+
+With the reference M²RNN backend (per-token tanh nonlinearity, single
+rank-1 write):
+
+| | train pop_acc | L=16 | L=32 | L=64 | L=128 | L=256 | L=512 |
+|---|---|---|---|---|---|---|---|
+| ref_m2rnn (tanh, per-token) | 100% | 100% | 99% | 95% | 88% | 76% | **65%** |
+| identity (linear) | 99% | 99% | 95% | 87% | 73% | 49% | **16%** |
+| rmsnorm | 88% | 87% | 78% | 64% | 42% | 22% | 12% |
+| tanh_res | 95% | 95% | 89% | 75% | 57% | 31% | 14% |
+| gru | 96% | 95% | 88% | 73% | 53% | 28% | 13% |
+
+Now the gap is unmistakable. Linear variants train fine in-distribution
+(can fit a depth-`d` stack as long as `d ≤ state_dim`) but extrapolate
+**below random** at `L=512`. M²RNN extrapolates gracefully — the
+per-token `tanh(SW + kv^T)` actually compresses the stack rather than
+just storing it.
+
+Boundary nonlinearities (`tanh_res`, `gru`, `rmsnorm`) sit *between*
+identity and m2rnn but closer to identity. Because the **within-chunk**
+update is still linear, they can't break the regular-language ceiling
+either; they just slightly improve the consolidation of what fits.
+
+---
+
+## 10. The big picture: linear vs non-linear RNNs
+
+The whole arc of these notes is one observation:
+
+> **Linear-in-state RNNs (with input-dependent A(x), B(x)) are exactly
+> as expressive as DFAs. Non-linear RNNs are strictly more expressive
+> (context-free → Turing-complete in the limit).**
+
+### 10.1 The expressivity ladder
+
+| class | gates depend on | per-step recurrence | formal power |
+|---|---|---|---|
+| LTI (S4 vanilla, RetNet) | nothing (constant) | `S ← A S + B u` | sub-regular (linear filter) |
+| **Linear-in-state, input-gated** (Mamba, GLA, GDN, DeltaNet) | input `x_t` | `S ← A(x_t) S + B(x_t) u_t` | **regular (DFAs)** |
+| **Non-linear in state** (RNN, LSTM, GRU, M²RNN) | input + state | `S ← σ(A(x_t) S + B(x_t) u_t)` | **context-free, ≥ regular**; Turing-complete in the limit (Siegelmann-Sontag '95) |
+
+Two qualifiers matter:
+
+1. **Input-dependent transitions are necessary.** A linear RNN with
+   constant `A, B` (an LTI system) can't even XOR. The recurrences need
+   `A(x_t), B(x_t)` to be functions of the current token to express any
+   non-trivial DFA. This is why Mamba's "selective scan" is a big deal
+   over S4-style time-invariance.
+2. **The state nonlinearity is what breaks the DFA ceiling.** Composing
+   `T` linear maps gives a linear map. Composing `T` non-linear maps
+   gives an exponentially deeper non-linear function, which is the
+   source of the extra expressivity.
+
+So both knobs are real:
+- input-dependent gating: LTI → regular.
+- state nonlinearity:    regular → context-free / Turing-complete.
+
+### 10.2 Why linear-in-state didn't die when we discovered it can't state-track
+
+It looked for a while like Mamba/GLA/DeltaNet were "just DFAs" and
+should be replaced by something more expressive. They weren't, because:
+
+- **Most of language is regular at the local level.** Recent-context
+  recall, induction heads, syntactic tagging, KV lookup — all DFA-fits.
+  The CFG/CSL pieces of natural text are rare and the LM loss is
+  dominated by local prediction.
+- **Parallelism is huge.** Linear-in-state recurrences admit a parallel
+  scan (associative composition of matrices). Non-linear recurrences
+  are sequential. At training scale this is the difference between
+  "1× hardware" and "20× hardware" for the same compute budget.
+- **Gradient flow is clean.** Matrix products propagate gradients
+  without the saturating-tanh problem; LSTM/GRU spent decades fighting
+  what linear RNNs get for free.
+
+The cost of going non-linear is real (gradient flow + parallelism), so
+the practical design principle is **"use as little nonlinearity as you
+can get away with."** Mamba/GLA/DeltaNet sit *just below* the regular
+ceiling. M²RNN, vanilla RNN, LSTM sit *just above* it.
+
+### 10.3 Where this project landed
+
+- The original proposal (linear chunks + nonlinear boundary) is a
+  reasonable interpolation point on the parallelism/expressivity
+  trade-off, **but it doesn't escape the regular-language ceiling.**
+  At `chunk_size=1` it does (it becomes a fully non-linear RNN), but
+  then you've also lost the parallel-scan benefit.
+- For S_n / counters / any DFA-fit task, plain linear delta-rule with
+  enough state dim wins. The boundary nonlinearity is overhead.
+- For genuinely non-regular tasks (deep Dyck-2, unbounded counting,
+  context-free parsing), the **per-token state nonlinearity** in M²RNN
+  is what does the work. A boundary-only nonlinearity, no matter how
+  clever, can't replicate it because the within-chunk path is still
+  linear.
+
+### 10.4 Decision rule for picking an architecture
+
+| if your task is... | use |
+|---|---|
+| dominated by local context (LM, copy, retrieval) | linear-in-state, input-gated. Add value residual + output gate to the readout. Mamba / GLA / DeltaNet. |
+| a finite-state machine with bounded state (regular language, S_n, modular arithmetic, bounded counters) | linear-in-state, **no boundary nonlinearity needed**. State dim ≥ DFA size. |
+| genuinely unbounded-state / context-free (deep Dyck, balanced parens, nested calls) | non-linear in state. M²RNN, LSTM, vanilla RNN. Pay the parallelism cost. |
+| mixture (most realistic settings) | hybrid: linear-in-state mixer + occasional non-linear blocks (or Transformer attention layers, which are essentially per-token non-linear in S). |
+
+The clean conceptual answer to the question that started this thread —
+*are non-linear RNNs with input-dependent gating more powerful?* —
+is **yes, strictly so**, but the gap only matters on tasks that genuinely
+need it. Almost all of the practical wins come from input-dependent
+gating alone (which is already a big jump from LTI), and the extra
+state nonlinearity is a tool you reach for only when you can prove
+your task is beyond regular.

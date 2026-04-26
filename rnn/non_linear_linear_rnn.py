@@ -49,6 +49,29 @@ class NonLinearLinearRNNConfig:
     use_short_conv: bool = True
     short_conv_kernel: int = 4
 
+    # SwiGLU MLP after the sequence mixer (`x + mixer(norm1(x)); x + mlp(norm2(x))`).
+    # Standard transformer-block convention; ref M²RNN baseline uses it. Set
+    # `use_mlp=False` to recover the older mixer-only block.
+    use_mlp: bool = True
+    # SwiGLU has 3 weight matrices vs vanilla MLP's 2, so the standard
+    # param-budget-matched ratio is 8/3 ≈ 2.67x hidden (vanilla uses 4x).
+    # Default to None -> auto-set to round_to_64(dim * 8/3).
+    intermediate_size: int | None = None
+
+    # M²RNN-only knobs (architecture="m2rnn").
+    #   - b_f init: 0 means f=sigmoid(0)=0.5 at init (paper / github default).
+    #     Higher values (e.g. 3 -> f≈0.95) preserve state longer at init but
+    #     also kill gradient flow through BPTT: with f^L decay, b_f=3 over
+    #     L=128 attenuates gradients by ~5e-4, making the recurrence
+    #     essentially untrainable. Empirically b_f=0 trains; b_f=3 does not.
+    #   - per-step elementwise gradient clip on H during BPTT (github
+    #     reference clips H's grad to [-gc, gc]).
+    #   - output gate g_t and v residual `w_r ⊙ v_t`, with RMSNorm before
+    #     o_proj (paper Eq. 21).
+    m2rnn_b_f_init: float = 0.0
+    m2rnn_grad_clip: float = 1.0
+    m2rnn_full_block: bool = False
+
     # Controls the *initial* magnitude of the per-token decay gk inside a chunk.
     # gk ~ -exp(A_log) * softplus(gk_raw + dt_bias).
     # "mild"   -> dt ~ [1e-4, 1e-3], A ~ [0.1, 1.0]  -> gk/token ~ -1e-4
@@ -583,29 +606,37 @@ class M2RNNAttn(nn.Module):
 
     Closely follows the public reference torch implementation in
     https://github.com/open-lm-engine/accelerated-model-architectures/blob/main/xma/layers/m2rnn/op.py
-    (`forward_backward_torch`). Differences from the github code, all minor:
-        - We initialize W with the identity (paper §3.1, "Transition Matrix
-          Initialization") rather than `nn.init.normal_` (which is what the
-          public `module.py.reset_parameters` does — paper says identity is
-          on par with orthogonal and is what they actually use for models).
-        - We apply `sigmoid` to the forget input so f ∈ [0, 1]. The github
-          op.py passes `f` raw; presumably the user-side wraps it. We keep
-          the gate well-defined.
-        - We use the same `num_heads` for q, k, v, f, W (no multi-query /
-          multi-value head sharing). This is sufficient for benchmarking.
-        - We optionally apply the same depthwise short-conv on q, k, v as
-          the linear-chunks path, so direct comparisons are apples-to-apples.
+    (`forward_backward_torch`).
 
-    Recurrence (torch reference, per token):
-        x_t  = k_t v_t^T                                # (N, K, V) outer prod
-        cand = tanh(H_{t-1} W + x_t)                     # (N, K, V)
-        f_t  = sigmoid(W_f x_t + b_f)                    # (N,)
-        H_t  = f_t H_{t-1} + (1 - f_t) cand              # (N, K, V)
-        y_t  = q_t^T H_t                                  # (N, V)
+    Implementation notes vs the github code, all motivated by the paper:
+      - W is identity-initialized (paper §3.1), not normal-initialized.
+      - sigmoid on f for stability (github passes raw; user-side wraps it).
+      - b_f init = `m2rnn_b_f_init` (default 3.0, paper-style) so f ≈ 0.95
+        at init -> state is preserved across tokens at the start of training.
+        With f ≈ 0.5 (b_f=0) the state has 1-step half-life, which kills
+        gradient through long sequences and prevents learning on hard
+        state-tracking tasks like S_n.
+      - Per-step elementwise gradient clip on H via a hook (matches the
+        github `clip_gradients` helper). Disabled when `m2rnn_grad_clip <= 0`.
+      - Optional full block (config.m2rnn_full_block):
+            y_t       = H_t^T q_t + w_r ⊙ v_t        (paper Eq. 20)
+            y_gated   = SiLU(W_g x) ⊙ y_t            (paper Eq. 21)
+            out_t     = W_o RMSNorm(y_gated)
+        i.e. output gate `g_t = SiLU(W_g x)`, value-residual `w_r ⊙ v_t`,
+        and RMSNorm before the output projection. With m2rnn_full_block=False
+        we skip the gate / residual / RMSNorm and just do `out = W_o y_t`,
+        matching the bare github layer.
+
+    Recurrence (per token, identical regardless of full_block):
+        kv_t  = k_t v_t^T                                # (N, K, V) outer prod
+        cand  = tanh(H_{t-1} W + kv_t)                   # (N, K, V)
+        f_t   = sigmoid(W_f x + b_f)                      # (N,)
+        H_t   = f_t H_{t-1} + (1 - f_t) cand              # (N, K, V)
+        y_t   = q_t^T H_t  (+ w_r ⊙ v_t if full_block)   # (N, V)
 
     The whole loop is sequential — no chunked / parallel fast path. For our
-    benchmarks (L ≤ 512) this is fine; the public repo's triton kernels
-    are for production-scale training.
+    benchmarks (L ≤ 512) this is fine; the public repo's triton kernels are
+    for production-scale training.
     """
 
     def __init__(self, config: NonLinearLinearRNNConfig):
@@ -620,16 +651,27 @@ class M2RNNAttn(nn.Module):
         self.q_proj = nn.Linear(D, N * K, bias=False)
         self.k_proj = nn.Linear(D, N * K, bias=False)
         self.v_proj = nn.Linear(D, N * V, bias=False)
-        # Forget-gate input projection. Output is per-head scalar; we apply
-        # sigmoid in forward. b_f init = 0 -> f starts at 0.5 (balanced).
+        # Forget-gate input projection. Per-head scalar -> we apply sigmoid
+        # in forward. b_f init = m2rnn_b_f_init (default 3.0) -> f ≈ 0.95
+        # at init so state is preserved across tokens at the start of
+        # training. This is the paper's recommendation and is critical for
+        # state-tracking tasks: with b_f=0, f=0.5 -> state has 1-step
+        # half-life and the model can't learn long-range dependencies.
         self.f_proj = nn.Linear(D, N, bias=True)
-        nn.init.zeros_(self.f_proj.bias)
+        nn.init.constant_(self.f_proj.bias, config.m2rnn_b_f_init)
 
-        # Identity init on W (paper). With H_0 = 0 and W = I, the recurrence
-        # at step 0 reduces to H_1 = (1 - f_1) tanh(k_1 v_1^T), i.e. a clean
-        # associative-memory write. The model learns deviations from identity.
-        W_init = torch.eye(V).unsqueeze(0).repeat(N, 1, 1)
-        self.W = nn.Parameter(W_init)
+        # # Identity init on W (paper). With H_0 = 0 and W = I, the recurrence
+        # # at step 0 reduces to H_1 = (1 - f_1) tanh(k_1 v_1^T), i.e. a clean
+        # # associative-memory write. The model learns deviations from identity.
+        # W_init = torch.eye(V).unsqueeze(0).repeat(N, 1, 1)
+        # self.W = nn.Parameter(W_init)
+
+        # Xavier-normal init on W with std=1/sqrt(V) to match the reference
+        # M2RNN implementation. This keeps the spectral radius O(1) at init
+        # so BPTT is numerically stable, while letting the model mix the V
+        # axis from step 0 (vs. identity which is a no-op).
+        self.W = nn.Parameter(torch.empty(N, V, V))
+        nn.init.normal_(self.W, mean=0.0, std=1.0 / math.sqrt(V))
 
         self.use_short_conv = config.use_short_conv
         if self.use_short_conv:
@@ -637,7 +679,25 @@ class M2RNNAttn(nn.Module):
             self.k_conv = ShortConv(N * K, config.short_conv_kernel)
             self.v_conv = ShortConv(N * V, config.short_conv_kernel)
 
+        # Full-block extras (paper Eqs. 20-21):
+        #   y_t = H_t^T q_t + w_r ⊙ v_t    (value residual, per (N, V))
+        #   out = W_o RMSNorm(SiLU(W_g x) ⊙ y_t)
+        self.full_block = config.m2rnn_full_block
+        if self.full_block:
+            self.g_proj = nn.Linear(D, N * V, bias=False)        # SiLU(W_g x)
+            self.w_r = nn.Parameter(torch.zeros(N, V))           # value residual
+            self.out_norm = nn.RMSNorm(N * V)
         self.o_proj = nn.Linear(N * V, D, bias=False)
+
+        self.grad_clip = float(config.m2rnn_grad_clip)
+
+    def _maybe_clip_h_grad(self, H):
+        """Register an elementwise grad clip hook on H (matches github
+        `clip_gradients` helper). No-op when grad_clip <= 0 or in eval."""
+        if self.grad_clip > 0.0 and H.requires_grad:
+            gc = self.grad_clip
+            H.register_hook(lambda g: g.clamp(-gc, gc))
+        return H
 
     def forward(self, x, H0=None):
         B, L, D = x.shape
@@ -654,10 +714,7 @@ class M2RNNAttn(nn.Module):
         k = k.view(B, L, N, K)
         v = v.view(B, L, N, V)
 
-        # Sigmoid -> f ∈ [0, 1]. Github passes raw; we sigmoid for stability.
         f = torch.sigmoid(self.f_proj(x))                              # (B, L, N)
-
-        # Rank-1 outer-product input contribution per token.
         kv = k.unsqueeze(-1) * v.unsqueeze(-2)                         # (B, L, N, K, V)
 
         if H0 is None:
@@ -672,11 +729,20 @@ class M2RNNAttn(nn.Module):
             f_t = f[:, t, :, None, None]                                # (B, N, 1, 1)
             cand = torch.tanh(H @ W + kv[:, t])                         # (B, N, K, V)
             H = f_t * H + (1.0 - f_t) * cand
+            H = self._maybe_clip_h_grad(H)
             y_t = (q[:, t].unsqueeze(-2) @ H).squeeze(-2)               # (B, N, V)
             ys.append(y_t)
 
         y = torch.stack(ys, dim=1)                                       # (B, L, N, V)
-        y = y.flatten(-2, -1)                                            # (B, L, N*V)
+
+        if self.full_block:
+            # Value residual: w_r ⊙ v_t broadcast over batch / time.
+            y = y + self.w_r[None, None, :, :] * v                       # (B, L, N, V)
+            y = y.flatten(-2, -1)                                        # (B, L, N*V)
+            g = F.silu(self.g_proj(x))                                   # (B, L, N*V)
+            y = self.out_norm(y * g)
+        else:
+            y = y.flatten(-2, -1)                                        # (B, L, N*V)
         out = self.o_proj(y)
         return out, H
 
@@ -686,10 +752,44 @@ class M2RNNAttn(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class SwiGLU(nn.Module):
+    """SwiGLU MLP: w3(silu(w1(x)) * w2(x)).
+
+    Standard transformer-block MLP since LLaMA / PaLM. Three weight matrices
+    instead of two; with intermediate ≈ 8/3 * hidden the param count matches
+    a vanilla 4*hidden two-matrix MLP.
+    """
+
+    def __init__(self, dim: int, intermediate: int):
+        super().__init__()
+        self.w1 = nn.Linear(dim, intermediate, bias=False)
+        self.w2 = nn.Linear(dim, intermediate, bias=False)
+        self.w3 = nn.Linear(intermediate, dim, bias=False)
+
+    def forward(self, x):
+        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+
+
+def _default_intermediate_size(dim: int) -> int:
+    """Round up dim * 8/3 to the nearest multiple of 64.
+
+    This is the SwiGLU param-budget convention (matches a 4*dim vanilla MLP).
+    """
+    target = int(round(dim * 8 / 3))
+    return ((target + 63) // 64) * 64
+
+
 class NonLinearLinearRNNBlock(nn.Module):
+    """Transformer-style block: RMSNorm + sequence mixer + residual,
+    optionally followed by RMSNorm + SwiGLU MLP + residual.
+
+        x = x + mixer(norm1(x))
+        x = x + mlp(norm2(x))   # only if config.use_mlp
+    """
+
     def __init__(self, config: NonLinearLinearRNNConfig):
         super().__init__()
-        self.norm = nn.RMSNorm(config.dim)
+        self.norm1 = nn.RMSNorm(config.dim)
         if config.architecture == "linear_chunks":
             self.attn = NonLinearLinearRNNAttn(config)
         elif config.architecture == "m2rnn":
@@ -697,9 +797,18 @@ class NonLinearLinearRNNBlock(nn.Module):
         else:
             raise ValueError(f"unknown architecture: {config.architecture}")
 
+        self.use_mlp = config.use_mlp
+        if self.use_mlp:
+            inter = config.intermediate_size or _default_intermediate_size(config.dim)
+            self.norm2 = nn.RMSNorm(config.dim)
+            self.mlp = SwiGLU(config.dim, inter)
+
     def forward(self, x):
-        out, _ = self.attn(self.norm(x))
-        return x + out
+        out, _ = self.attn(self.norm1(x))
+        x = x + out
+        if self.use_mlp:
+            x = x + self.mlp(self.norm2(x))
+        return x
 
 
 class NonLinearLinearRNNLM(nn.Module):

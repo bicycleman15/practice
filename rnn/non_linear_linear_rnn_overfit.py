@@ -1,133 +1,153 @@
 """
-Overfit a single batch with the NonLinearLinearRNNLM across all four boundary
-non-linearity variants, to sanity-check that each configuration can actually
-drive the loss toward zero.
+Overfit test for M²RNN on S_n state tracking.
 
-Run with:
-    source ~/.zshrc && conda activate t3
-    python -m rnn.non_linear_linear_rnn_overfit
+Train on a SINGLE fixed batch and check that the model can memorize it
+(loss -> 0, accuracy -> 100%). This isolates "the model can fit" from
+"the model can generalize". If overfit fails, there's an architectural
+bug; if it succeeds, the issue with the full benchmark is training scale
+or generalization, not the impl.
+
+Default: S_3 (paper's actual benchmark group), B=4, L=128, 2000 steps.
+Comparison: also runs the linear_chunks/identity baseline as a sanity-
+check that the training loop itself works on the same fixed batch.
 """
 
-import math
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from rnn.non_linear_linear_rnn import NonLinearLinearRNNConfig, NonLinearLinearRNNLM
+from rnn.non_linear_linear_rnn import (
+    NonLinearLinearRNNConfig,
+    NonLinearLinearRNNLM,
+)
+from rnn.non_linear_linear_rnn_s3 import (
+    SnConfig,
+    _build_sn_cayley,
+    make_batch,
+    _pick_device,
+)
+from math import factorial
 
 
 @dataclass
 class OverfitConfig:
-    batch_size: int = 2
-    seqlen: int = 128
-    steps: int = 200
-    lr: float = 3e-3
+    group_n: int = 3
+    L: int = 128
+    batch_size: int = 4
+    steps: int = 2000
+    lr: float = 1e-2
     seed: int = 0
-    log_every: int = 10          # update tqdm postfix every N steps (keeps non-TTY output tidy)
+    log_every: int = 100
 
-    # model
-    dim: int = 64
+    dim: int = 128
     num_heads: int = 2
-    head_k_dim: int = 16
-    head_v_dim: int = 16
-    layers: int = 2
-    vocab_size: int = 256
-    chunk_size: int = 16
-    use_short_conv: bool = True
+    head_k_dim: int = 32
+    head_v_dim: int = 32
+    layers: int = 1
+
+    # If True, also run linear_chunks/identity baseline as a sanity check
+    # that the training loop / data pipeline works on the same fixed batch.
+    # Skip this once you've seen it converge once.
+    run_baseline: bool = False
+    # Early-stop a run as soon as accuracy stays >= this for `early_stop_k`
+    # consecutive steps. Saves time when the model converges quickly.
+    early_stop_acc: float = 0.999
+    early_stop_k: int = 20
 
 
-def _pick_device():
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def overfit_one_variant(boundary_nonlin: str, cfg: OverfitConfig, device: str):
-    torch.manual_seed(cfg.seed)
-
-    model_config = NonLinearLinearRNNConfig(
-        dim=cfg.dim,
-        num_heads=cfg.num_heads,
-        head_k_dim=cfg.head_k_dim,
-        head_v_dim=cfg.head_v_dim,
-        layers=cfg.layers,
-        vocab_size=cfg.vocab_size,
-        chunk_size=cfg.chunk_size,
+def run_overfit(architecture: str, boundary_nonlin: str, oc: OverfitConfig,
+                cayley_t, identity_idx, vocab_size, device,
+                input_ids, target_ids):
+    torch.manual_seed(oc.seed)
+    cfg = NonLinearLinearRNNConfig(
+        dim=oc.dim,
+        num_heads=oc.num_heads,
+        head_k_dim=oc.head_k_dim,
+        head_v_dim=oc.head_v_dim,
+        layers=oc.layers,
+        vocab_size=vocab_size,
+        chunk_size=1,
         boundary_nonlin=boundary_nonlin,
-        use_short_conv=cfg.use_short_conv,
+        use_short_conv=True,
+        decay_init="mild",
+        allow_neg_eigval=True,
+        architecture=architecture,
     )
-    model = NonLinearLinearRNNLM(model_config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    model = NonLinearLinearRNNLM(cfg).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    optim = torch.optim.AdamW(model.parameters(), lr=oc.lr)
 
-    input_ids = torch.randint(
-        0, cfg.vocab_size, (cfg.batch_size, cfg.seqlen), device=device,
-    )
+    tag = architecture if architecture == "m2rnn" else f"{architecture}/{boundary_nonlin}"
+    print(f"\n--- overfit run: {tag}  ({n_params/1e6:.2f}M params) ---")
 
-    initial_loss = math.log(cfg.vocab_size)
-    bar = tqdm(
-        range(cfg.steps),
-        desc=f"overfit [{boundary_nonlin:<9s}]",
-        mininterval=0.5,
-        miniters=cfg.log_every,
-    )
-    final_loss = float("nan")
-    min_loss = float("inf")
+    bar = tqdm(range(oc.steps), desc=tag, mininterval=0.5)
+    last_acc = 0.0
+    last_loss = float("inf")
+    streak = 0
     for step in bar:
-        optimizer.zero_grad()
         logits = model(input_ids)
-        loss = F.cross_entropy(
-            logits.view(-1, logits.shape[-1]),
-            input_ids.view(-1),
-        )
+        loss = F.cross_entropy(logits.reshape(-1, vocab_size), target_ids.reshape(-1))
+        optim.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optim.step()
+        with torch.no_grad():
+            acc = (logits.argmax(-1) == target_ids).float().mean().item()
+        last_acc = acc
+        last_loss = loss.item()
+        bar.set_postfix_str(f"loss={last_loss:.4f} acc={acc:.2%} gn={gn:.3f}")
 
-        final_loss = loss.item()
-        min_loss = min(min_loss, final_loss)
-        if (step + 1) % cfg.log_every == 0 or step == cfg.steps - 1:
-            bar.set_postfix_str(
-                f"loss={final_loss:.4f} min={min_loss:.4f} (init~{initial_loss:.2f})"
-            )
+        if acc >= oc.early_stop_acc:
+            streak += 1
+            if streak >= oc.early_stop_k:
+                bar.close()
+                print(f"  early-stop at step {step+1}: acc={acc:.2%} for {streak} steps")
+                break
+        else:
+            streak = 0
 
-    with torch.no_grad():
-        logits = model(input_ids)
-        preds = logits.argmax(dim=-1)
-        acc = (preds == input_ids).float().mean().item()
-
-    return {
-        "variant": boundary_nonlin,
-        "final_loss": final_loss,
-        "min_loss": min_loss,
-        "token_acc": acc,
-    }
+    return last_loss, last_acc
 
 
 def main():
-    cfg = OverfitConfig()
+    oc = OverfitConfig()
     device = _pick_device()
-    print(f"device={device}  cfg={cfg}\n")
+    perms, cayley = _build_sn_cayley(oc.group_n)
+    vocab_size = factorial(oc.group_n)
+    identity_idx = perms.index(tuple(range(oc.group_n)))
+    cayley_t = torch.tensor(cayley, dtype=torch.long)
 
-    results = []
-    for kind in ["identity", "rmsnorm", "tanh_res", "gru"]:
-        results.append(overfit_one_variant(kind, cfg, device))
+    print(f"device={device}")
+    print(f"S_{oc.group_n}  vocab={vocab_size}  L={oc.L}  B={oc.batch_size}  steps={oc.steps}")
+    print(f"random-guess accuracy: {1/vocab_size:.2%}")
+
+    # Build ONE fixed batch and reuse it every step.
+    torch.manual_seed(oc.seed)
+    input_ids, target_ids = make_batch(
+        oc.batch_size, oc.L, vocab_size, cayley_t, identity_idx, device,
+    )
+
+    runs = []
+    if oc.run_baseline:
+        # Sanity-check: the simplest delta-rule + identity baseline. Should
+        # easily memorize a small fixed batch. If this fails, the training
+        # loop itself is broken.
+        runs.append(("linear_chunks", "identity"))
+    # M²RNN under test.
+    runs.append(("m2rnn", "m2rnn"))
+    results = {}
+    for arch, kind in runs:
+        loss, acc = run_overfit(arch, kind, oc, cayley_t, identity_idx,
+                                 vocab_size, device, input_ids, target_ids)
+        tag = arch if arch == "m2rnn" else f"{arch}/{kind}"
+        results[tag] = (loss, acc)
 
     print("\n=== overfit summary ===")
-    print(f"  initial CE loss (uniform over {cfg.vocab_size} tokens) ~ {math.log(cfg.vocab_size):.3f}")
-    header = f"  {'variant':<10s} {'final_loss':>12s} {'min_loss':>12s} {'token_acc':>12s}"
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-    for r in results:
-        print(
-            f"  {r['variant']:<10s} "
-            f"{r['final_loss']:>12.4f} "
-            f"{r['min_loss']:>12.4f} "
-            f"{r['token_acc']:>12.2%}"
-        )
+    for tag, (loss, acc) in results.items():
+        verdict = "PASS" if acc > 0.99 else "FAIL"
+        print(f"  {tag:<25s}  final loss={loss:.4f}  acc={acc:.2%}  [{verdict}]")
 
 
 if __name__ == "__main__":
